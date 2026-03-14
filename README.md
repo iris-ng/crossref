@@ -14,8 +14,7 @@ A lightweight document registry and management tool. It watches a folder, assign
 
 - Python 3.8+
 - [python-docx](https://python-docx.readthedocs.io/)
-- [redlines](https://github.com/houfu/redlines)
-
+  
 ```bash
 pip install -r requirements.txt
 ```
