@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Document Registry</title>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, sans-serif;
+      background: #f4f6f9;
+      color: #222;
+      padding: 2rem;
+    }
+
+    header {
+      margin-bottom: 1.5rem;
+    }
+
+    header h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      color: #1a1a2e;
+    }
+
+    header p {
+      font-size: 0.85rem;
+      color: #666;
+      margin-top: 0.3rem;
+    }
+
+    #meta {
+      font-size: 0.82rem;
+      color: #888;
+      margin-bottom: 1rem;
+    }
+
+    #status-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 1.2rem;
+    }
+
+    #status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #ccc;
+      flex-shrink: 0;
+    }
+    #status-dot.ok  { background: #22c55e; }
+    #status-dot.err { background: #ef4444; }
+
+    #status-text { font-size: 0.82rem; color: #555; }
+
+    #refresh-btn {
+      margin-left: 0.5rem;
+      padding: 0.25rem 0.75rem;
+      font-size: 0.8rem;
+      border: 1px solid #c7d2fe;
+      border-radius: 4px;
+      background: #eef2ff;
+      color: #4f46e5;
+      cursor: pointer;
+    }
+    #refresh-btn:hover { background: #e0e7ff; }
+
+    #export-btn {
+      margin-left: 0.5rem;
+      padding: 0.25rem 0.75rem;
+      font-size: 0.8rem;
+      border: 1px solid #bbf7d0;
+      border-radius: 4px;
+      background: #f0fdf4;
+      color: #16a34a;
+      cursor: pointer;
+    }
+    #export-btn:hover { background: #dcfce7; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    }
+
+    thead tr { background: #1a1a2e; color: #fff; }
+    thead th { padding: 0.75rem 1rem; text-align: left; font-size: 0.82rem; letter-spacing: 0.04em; text-transform: uppercase; }
+    .subfolder { color: #6b7280; font-size: 0.8rem; }
+
+    tbody tr:nth-child(even) { background: #f9fafb; }
+    tbody tr:hover { background: #eef2ff; }
+
+    td { padding: 0.65rem 1rem; font-size: 0.92rem; border-bottom: 1px solid #e5e7eb; }
+
+    .doc-id {
+      font-family: monospace;
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: #4f46e5;
+      letter-spacing: 0.08em;
+    }
+
+    .added-at { color: #888; font-size: 0.8rem; }
+    .file-link { color: #1a1a2e; text-decoration: none; }
+    .file-link:hover { text-decoration: underline; color: #4f46e5; }
+    .deleted { color: #ef4444; font-size: 0.8rem; font-weight: 600; }
+
+    #empty { display: none; text-align: center; padding: 2rem; color: #aaa; font-size: 0.95rem; }
+
+    #search {
+      width: 100%;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.9rem;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      outline: none;
+    }
+    #search:focus { border-color: #4f46e5; box-shadow: 0 0 0 2px #e0e7ff; }
+
+    #target-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin-bottom: 1rem;
+    }
+    #target-bar label { font-size: 0.85rem; color: #555; white-space: nowrap; }
+    #target-input {
+      flex: 1;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.9rem;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      outline: none;
+    }
+    #target-input:focus { border-color: #4f46e5; box-shadow: 0 0 0 2px #e0e7ff; }
+
+    #apply-all-btn {
+      padding: 0.5rem 1rem;
+      font-size: 0.85rem;
+      border: none;
+      border-radius: 6px;
+      background: #4f46e5;
+      color: #fff;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #apply-all-btn:hover:not(:disabled) { background: #4338ca; }
+    #apply-all-btn:disabled { opacity: 0.5; cursor: default; }
+
+    #apply-all-status {
+      font-size: 0.82rem;
+      margin-bottom: 0.75rem;
+      min-height: 1.2rem;
+      color: #555;
+    }
+
+    .apply-btn {
+      padding: 0.2rem 0.6rem;
+      font-size: 0.78rem;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+      background: #f9fafb;
+      color: #374151;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .apply-btn:hover:not(:disabled) { background: #e0e7ff; border-color: #4f46e5; color: #4f46e5; }
+    .apply-btn:disabled { opacity: 0.4; cursor: default; }
+
+    .ref-cell { cursor: text; min-width: 10rem; color: #374151; }
+    .ref-cell:empty::before { content: 'Click to add…'; color: #ccc; font-style: italic; }
+    .ref-cell input {
+      width: 100%;
+      border: 1px solid #4f46e5;
+      border-radius: 4px;
+      padding: 0.2rem 0.4rem;
+      font-size: 0.9rem;
+      outline: none;
+    }
+
+    #countdown { font-size: 0.78rem; color: #aaa; margin-top: 1rem; }
+
+    #pagination {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-top: 1rem;
+      font-size: 0.85rem;
+      color: #555;
+      flex-wrap: wrap;
+    }
+    #pagination button {
+      padding: 0.25rem 0.65rem;
+      font-size: 0.82rem;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+      background: #fff;
+      color: #374151;
+      cursor: pointer;
+    }
+    #pagination button:hover:not(:disabled) { background: #eef2ff; border-color: #4f46e5; color: #4f46e5; }
+    #pagination button:disabled { opacity: 0.4; cursor: default; }
+    #pagination button.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+    #page-size-select {
+      padding: 0.2rem 0.4rem;
+      font-size: 0.82rem;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+      outline: none;
+    }
+    #page-info { color: #888; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Document Registry</h1>
+    <p>Auto-refreshes every 1 minute. Folder scanned server-side on the same schedule.</p>
+  </header>
+
+  <div id="status-bar">
+    <div id="status-dot"></div>
+    <span id="status-text">Loading…</span>
+    <button id="refresh-btn" onclick="forceRefresh()">Refresh</button>
+    <button id="export-btn" onclick="exportToExcel()">Export to Excel</button>
+  </div>
+
+  <div id="meta"></div>
+
+  <div id="target-bar">
+    <label for="target-input">Target document:</label>
+    <input id="target-input" type="text" placeholder="Filename or full path to .docx  e.g. report.docx" />
+    <button id="apply-all-btn" onclick="applyAll()">Apply All</button>
+  </div>
+  <div id="apply-all-status"></div>
+
+  <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1rem;">
+    <input id="search" type="text" placeholder="Search file names…" style="margin-bottom:0;flex:1;" />
+    <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.85rem;color:#555;white-space:nowrap;cursor:pointer;">
+      <input type="checkbox" id="show-deleted" checked /> Show deleted
+    </label>
+    <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.85rem;color:#555;white-space:nowrap;">
+      Rows:
+      <select id="page-size-select">
+        <option value="25">25</option>
+        <option value="50" selected>50</option>
+        <option value="100">100</option>
+      </select>
+    </label>
+  </div>
+
+  <table id="doc-table">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Document ID</th>
+        <th>Subfolder</th>
+        <th>File Name</th>
+        <th>Reference</th>
+        <th>Apply</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody id="doc-body">
+      <tr id="empty"><td colspan="7">No documents found in the watched folder.</td></tr>
+    </tbody>
+  </table>
+
+  <div id="pagination"></div>
+  <div id="countdown"></div>
+
+  <script>
+    const REFRESH_MS = 1 * 60 * 1000; // match server scan interval
+    let nextRefresh = Date.now() + REFRESH_MS;
+    let allDocs = [];
+    let currentPage = 1;
+
+    async function fetchDocuments() {
+      const dot  = document.getElementById('status-dot');
+      const text = document.getElementById('status-text');
+      try {
+        const res  = await fetch('/api/documents');
+        const data = await res.json();
+
+        dot.className  = 'ok';
+        const activeCount = data.documents.filter(d => !d.removedAt).length;
+        text.textContent = `Connected — ${activeCount} document(s) in "${data.folder}"`;
+
+        document.getElementById('meta').textContent =
+          `Last server update: ${new Date(data.lastUpdated).toLocaleString()}`;
+
+        allDocs = data.documents;
+        renderTable();
+        nextRefresh = Date.now() + REFRESH_MS;
+      } catch (err) {
+        dot.className  = 'err';
+        text.textContent = 'Could not reach server.';
+      }
+    }
+
+    function getPageSize() {
+      return parseInt(document.getElementById('page-size-select').value, 10);
+    }
+
+    function getFilteredDocs() {
+      const query = document.getElementById('search').value.toLowerCase();
+      const showDeleted = document.getElementById('show-deleted').checked;
+      let docs = allDocs;
+      if (!showDeleted) docs = docs.filter(d => !d.removedAt);
+      if (query) docs = docs.filter(d => d.fileName.toLowerCase().includes(query));
+      return docs;
+    }
+
+    function renderTable() {
+      const filtered = getFilteredDocs();
+      const pageSize = getPageSize();
+      const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+      if (currentPage > totalPages) currentPage = totalPages;
+
+      const start = (currentPage - 1) * pageSize;
+      const pageDocs = filtered.slice(start, start + pageSize);
+
+      const tbody = document.getElementById('doc-body');
+      tbody.innerHTML = '';
+
+      if (filtered.length === 0) {
+        const row = document.createElement('tr');
+        row.innerHTML = '<td colspan="7" style="text-align:center;color:#aaa;padding:2rem">No documents found in the watched folder.</td>';
+        tbody.appendChild(row);
+        renderPagination(0, 1, 1);
+        return;
+      }
+
+      pageDocs.forEach((doc, i) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${start + i + 1}</td>
+          <td><span class="doc-id">${doc.id}</span></td>
+          <td class="subfolder">${escapeHtml(doc.subfolder || '—')}</td>
+          <td><a class="file-link" href="#" data-subfolder="${escapeHtml(doc.subfolder || '')}" data-filename="${escapeHtml(doc.fileName)}">${escapeHtml(doc.fileName)}</a></td>
+          <td class="ref-cell" data-id="${doc.id}">${escapeHtml(doc.reference || '')}</td>
+          <td>${applyCell(doc)}</td>
+          <td>${doc.removedAt
+            ? '<span class="deleted">Deleted</span>'
+            : `<span class="added-at">${new Date(doc.addedAt).toLocaleString('en-GB')}</span>`
+          }</td>
+        `;
+        tbody.appendChild(tr);
+      });
+
+      renderPagination(filtered.length, totalPages, pageSize);
+    }
+
+    function renderPagination(total, totalPages, pageSize) {
+      const container = document.getElementById('pagination');
+      container.innerHTML = '';
+      if (totalPages <= 1 && total <= pageSize) return;
+
+      const start = (currentPage - 1) * pageSize + 1;
+      const end   = Math.min(currentPage * pageSize, total);
+
+      const info = document.createElement('span');
+      info.id = 'page-info';
+      info.textContent = `${start}–${end} of ${total}`;
+      container.appendChild(info);
+
+      const prev = document.createElement('button');
+      prev.textContent = '← Prev';
+      prev.disabled = currentPage === 1;
+      prev.addEventListener('click', () => { currentPage--; renderTable(); });
+      container.appendChild(prev);
+
+      // Page number buttons — show at most 7 slots with ellipsis
+      const pages = paginationSlots(currentPage, totalPages);
+      for (const slot of pages) {
+        if (slot === '…') {
+          const ellipsis = document.createElement('span');
+          ellipsis.textContent = '…';
+          ellipsis.style.padding = '0 0.25rem';
+          container.appendChild(ellipsis);
+        } else {
+          const btn = document.createElement('button');
+          btn.textContent = slot;
+          if (slot === currentPage) btn.classList.add('active');
+          btn.addEventListener('click', () => { currentPage = slot; renderTable(); });
+          container.appendChild(btn);
+        }
+      }
+
+      const next = document.createElement('button');
+      next.textContent = 'Next →';
+      next.disabled = currentPage === totalPages;
+      next.addEventListener('click', () => { currentPage++; renderTable(); });
+      container.appendChild(next);
+    }
+
+    function paginationSlots(current, total) {
+      if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
+      if (current <= 4) return [1, 2, 3, 4, 5, '…', total];
+      if (current >= total - 3) return [1, '…', total-4, total-3, total-2, total-1, total];
+      return [1, '…', current-1, current, current+1, '…', total];
+    }
+
+    function applyCell(doc) {
+      if (!doc.reference) return '<span style="color:#ccc;font-size:0.75rem">—</span>';
+      const label = doc.lastWrittenValue === doc.reference ? 'Re-apply' : 'Apply';
+      return `<button class="apply-btn" data-id="${escapeHtml(doc.id)}">${label}</button>`;
+    }
+
+    function escapeHtml(str) {
+      return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    document.getElementById('doc-body').addEventListener('click', async function(e) {
+      const btn = e.target.closest('button.apply-btn');
+      if (btn) {
+        const docId  = btn.dataset.id;
+        const target = document.getElementById('target-input').value.trim();
+        if (!target) {
+          alert('Please enter a target document path first.');
+          return;
+        }
+        btn.disabled = true;
+        btn.textContent = 'Applying…';
+        try {
+          const params = new URLSearchParams({ id: docId, target });
+          const res  = await fetch(`/api/replace?${params}`, { method: 'POST' });
+          const data = await res.json();
+          if (data.ok) {
+            const doc = allDocs.find(d => d.id === docId);
+            if (doc) doc.lastWrittenValue = doc.reference;
+            btn.textContent = 'Applied ✓';
+            setTimeout(() => { btn.textContent = 'Re-apply'; btn.disabled = false; }, 2000);
+          } else {
+            btn.textContent = data.error || 'Error';
+            setTimeout(() => { btn.textContent = 'Apply'; btn.disabled = false; }, 3000);
+          }
+        } catch {
+          btn.textContent = 'Error';
+          btn.disabled = false;
+        }
+        return;
+      }
+
+      const link = e.target.closest('a.file-link');
+      if (link) {
+        e.preventDefault();
+        const params = new URLSearchParams({ file: link.dataset.filename, subfolder: link.dataset.subfolder });
+        await fetch(`/api/open?${params}`, { method: 'POST' });
+        return;
+      }
+
+      const cell = e.target.closest('td.ref-cell');
+      if (!cell || cell.querySelector('input')) return; // already editing
+
+      const docId = cell.dataset.id;
+      const original = cell.textContent;
+
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = original;
+      cell.textContent = '';
+      cell.appendChild(input);
+      input.focus();
+
+      let saved = false;
+
+      async function save() {
+        if (saved) return;
+        saved = true;
+        const value = input.value;
+        await fetch(`/api/reference?id=${encodeURIComponent(docId)}`, {
+          method: 'POST',
+          body: value,
+        });
+        const doc = allDocs.find(d => d.id === docId);
+        if (doc) doc.reference = value;
+        cell.textContent = value;
+      }
+
+      function cancel() {
+        if (saved) return;
+        cell.textContent = original;
+      }
+
+      input.addEventListener('keydown', async function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); await save(); }
+        if (e.key === 'Escape') { cancel(); }
+      });
+
+      input.addEventListener('blur', save);
+    });
+
+    function updateCountdown() {
+      const secs = Math.max(0, Math.round((nextRefresh - Date.now()) / 1000));
+      const m = String(Math.floor(secs / 60)).padStart(2, '0');
+      const s = String(secs % 60).padStart(2, '0');
+      document.getElementById('countdown').textContent = `Next refresh in ${m}:${s}`;
+    }
+
+    async function forceRefresh() {
+      const btn = document.getElementById('refresh-btn');
+      btn.disabled = true;
+      btn.textContent = 'Scanning…';
+      try {
+        await fetch('/api/scan', { method: 'POST' });
+      } catch (_) {}
+      await fetchDocuments();
+      btn.disabled = false;
+      btn.textContent = 'Refresh';
+    }
+
+    async function applyAll() {
+      const target = document.getElementById('target-input').value.trim();
+      if (!target) { alert('Please enter a target document path first.'); return; }
+
+      const toApply = allDocs.filter(d => d.reference);
+      if (toApply.length === 0) { alert('No documents have a reference set.'); return; }
+
+      const btn    = document.getElementById('apply-all-btn');
+      const status = document.getElementById('apply-all-status');
+      btn.disabled = true;
+
+      let done = 0, failed = 0;
+      for (const doc of toApply) {
+        status.textContent = `Applying ${done + failed + 1} of ${toApply.length}: ${doc.fileName}…`;
+        try {
+          const params = new URLSearchParams({ id: doc.id, target });
+          const res  = await fetch(`/api/replace?${params}`, { method: 'POST' });
+          const data = await res.json();
+          if (data.ok) {
+            doc.lastWrittenValue = doc.reference;
+            done++;
+          } else {
+            failed++;
+            console.warn(`Failed (${doc.fileName}): ${data.error}`);
+          }
+        } catch (err) {
+          failed++;
+          console.warn(`Error (${doc.fileName}):`, err);
+        }
+      }
+
+      renderTable();
+      btn.disabled = false;
+      status.textContent = `Done — ${done} applied${failed ? `, ${failed} failed (see console)` : ''}.`;
+      setTimeout(() => { status.textContent = ''; }, 5000);
+    }
+
+    function exportToExcel() {
+      const docs = getFilteredDocs();
+
+      const rows = docs.map((doc, i) => ({
+        '#':             i + 1,
+        'ID':            doc.id,
+        'Subfolder':     doc.subfolder || '',
+        'File Name':     doc.fileName,
+        'Reference':     doc.reference || '',
+        'Last Written':  doc.lastWrittenValue || '',
+        'Added At':      doc.addedAt ? new Date(doc.addedAt).toLocaleString('en-GB') : '',
+        'Status':        doc.removedAt ? 'Deleted' : 'Active',
+      }));
+
+      const ws = XLSX.utils.json_to_sheet(rows);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Documents');
+
+      const date = new Date().toISOString().slice(0, 10);
+      XLSX.writeFile(wb, `document-registry-${date}.xlsx`);
+    }
+
+    document.getElementById('search').addEventListener('input', () => { currentPage = 1; renderTable(); });
+    document.getElementById('show-deleted').addEventListener('change', () => { currentPage = 1; renderTable(); });
+    document.getElementById('page-size-select').addEventListener('change', () => { currentPage = 1; renderTable(); });
+
+    fetchDocuments();
+    setInterval(fetchDocuments, REFRESH_MS);
+    setInterval(updateCountdown, 1000);
+  </script>
+</body>
+</html>
