@@ -13,6 +13,7 @@ import os
 import json
 import random
 import string
+import shutil
 import threading
 import time
 from datetime import datetime, timezone
@@ -29,10 +30,13 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 PORT = 3000
-SCAN_INTERVAL = 1 * 60          # seconds
-PUBLIC_DIR  = os.path.join(os.path.dirname(__file__), "public")
+SCAN_INTERVAL   = 1 * 60        # seconds
+BACKUP_INTERVAL = 15 * 60       # seconds
+PUBLIC_DIR   = os.path.join(os.path.dirname(__file__), "public")
 REGISTRY_DIR = os.path.join(os.path.dirname(__file__), "registries")
+BACKUP_DIR   = os.path.join(os.path.dirname(__file__), "backups")
 os.makedirs(REGISTRY_DIR, exist_ok=True)
+os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # CLI argument
@@ -114,29 +118,77 @@ def scan_folder():
         print(f"[error] Cannot read folder: {e}")
         return
 
-    # Register new files
-    for rel_key, (full_path, fname, subfolder) in current.items():
-        if rel_key not in docs:
-            new_id = generate_id(used_ids)
-            used_ids.add(new_id)
-            docs[rel_key] = {
-                "id": new_id,
-                "fileName": fname,
-                "subfolder": subfolder,
-                "addedAt": datetime.now(timezone.utc).isoformat(),
-            }
-            print(f"[+] New file: \"{rel_key}\" -> ID: {new_id}")
-            changed = True
+    def get_fingerprint(path):
+        try:
+            st = os.stat(path)
+            return (st.st_size, st.st_mtime)
+        except OSError:
+            return None
 
-    # Mark removed / restored files
+    # Build fingerprint map for active entries that are now missing (rename candidates)
+    # fingerprint -> old_rel_key
+    gone_by_fp = {}
     for rel_key, doc in docs.items():
-        if rel_key not in current:
-            if "removedAt" not in doc:
-                doc["removedAt"] = datetime.now(timezone.utc).isoformat()
+        if rel_key not in current and "removedAt" not in doc:
+            fp_raw = doc.get("_fingerprint")
+            if fp_raw is not None:
+                fp = tuple(fp_raw)
+                if fp not in gone_by_fp:
+                    gone_by_fp[fp] = rel_key
+
+    # Files present on disk with no registry entry yet
+    newly_seen = {k: v for k, v in current.items() if k not in docs}
+
+    # Rename detection: match each new file against a missing file by fingerprint
+    for new_key, (full_path, fname, subfolder) in list(newly_seen.items()):
+        fp = get_fingerprint(full_path)
+        if fp is None or fp not in gone_by_fp:
+            continue
+        old_key = gone_by_fp.pop(fp)
+        doc = docs.pop(old_key)
+        old_name = doc["fileName"]
+        old_subfolder = doc.get("subfolder", "")
+        doc["fileName"] = fname
+        doc["subfolder"] = subfolder
+        doc["_fingerprint"] = list(fp)
+        doc.setdefault("renames", []).append({
+            "from": old_name,
+            "fromSubfolder": old_subfolder,
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
+        docs[new_key] = doc
+        del newly_seen[new_key]
+        print(f"[~] Renamed: \"{old_key}\" -> \"{new_key}\" (ID: {doc['id']})")
+        changed = True
+
+    # Register remaining new files (no rename match found)
+    for rel_key, (full_path, fname, subfolder) in newly_seen.items():
+        new_id = generate_id(used_ids)
+        used_ids.add(new_id)
+        fp = get_fingerprint(full_path)
+        docs[rel_key] = {
+            "id": new_id,
+            "fileName": fname,
+            "subfolder": subfolder,
+            "addedAt": datetime.now(timezone.utc).isoformat(),
+            "_fingerprint": list(fp) if fp is not None else None,
+        }
+        print(f"[+] New file: \"{rel_key}\" -> ID: {new_id}")
+        changed = True
+
+    # Update fingerprints for active files; handle removals and restorations
+    for rel_key, doc in docs.items():
+        if rel_key in current:
+            fp = get_fingerprint(current[rel_key][0])
+            if fp is not None and doc.get("_fingerprint") != list(fp):
+                doc["_fingerprint"] = list(fp)
                 changed = True
-        else:
             if "removedAt" in doc:
                 del doc["removedAt"]
+                changed = True
+        else:
+            if "removedAt" not in doc:
+                doc["removedAt"] = datetime.now(timezone.utc).isoformat()
                 changed = True
 
     if changed:
@@ -153,6 +205,29 @@ def scanner_loop():
 
 
 # ---------------------------------------------------------------------------
+# Registry backup
+# ---------------------------------------------------------------------------
+
+def backup_registries():
+    """Copy all registry JSON files into a timestamped subfolder under backups/."""
+    json_files = [f for f in os.listdir(REGISTRY_DIR) if f.endswith(".json")]
+    if not json_files:
+        return
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    dest = os.path.join(BACKUP_DIR, stamp)
+    os.makedirs(dest, exist_ok=True)
+    for fname in json_files:
+        shutil.copy2(os.path.join(REGISTRY_DIR, fname), os.path.join(dest, fname))
+    print(f"[backup] {stamp} — {len(json_files)} registry file(s) backed up")
+
+
+def backup_loop():
+    while True:
+        time.sleep(BACKUP_INTERVAL)
+        backup_registries()
+
+
+# ---------------------------------------------------------------------------
 # HTTP request handler
 # ---------------------------------------------------------------------------
 
@@ -164,6 +239,9 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/documents":
             self._serve_api()
+        elif parsed.path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
         else:
             super().do_GET()
 
@@ -204,7 +282,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(b'{"error":"file not found on disk"}')
-        elif parsed.path == "/api/reference":
+        elif parsed.path in ("/api/reference", "/api/description"):
             from urllib.parse import parse_qs
             qs = parse_qs(parsed.query)
             doc_id = (qs.get("id") or [""])[0]
@@ -212,15 +290,16 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_response(400)
                 self.end_headers()
                 return
+            field = "description" if parsed.path == "/api/description" else "reference"
             length = int(self.headers.get("Content-Length", 0))
-            reference = self.rfile.read(length).decode("utf-8") if length else ""
+            value = self.rfile.read(length).decode("utf-8") if length else ""
             docs = load_docs()
             matched_key = next((k for k, d in docs.items() if d["id"] == doc_id), None)
             if matched_key is None:
                 self.send_response(404)
                 self.end_headers()
                 return
-            docs[matched_key]["reference"] = reference.strip()
+            docs[matched_key][field] = value.strip()
             save_docs(docs)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -322,20 +401,23 @@ class Handler(SimpleHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Initial scan
+    # Initial scan and backup
     scan_folder()
+    backup_registries()
 
-    # Background scanner thread
-    t = threading.Thread(target=scanner_loop, daemon=True)
-    t.start()
+    # Background threads
+    threading.Thread(target=scanner_loop, daemon=True).start()
+    threading.Thread(target=backup_loop,  daemon=True).start()
 
     # HTTP server
     httpd = HTTPServer(("", PORT), Handler)
     print(f"Server running at http://localhost:{PORT}")
     print(f"Watching folder : {TARGET_FOLDER}")
     print(f"Registry folder : {REGISTRY_DIR}")
+    print(f"Backup folder   : {BACKUP_DIR}")
     print(f"Registry file   : {DATA_FILE}")
     print(f"Scanning every  : 1 minute")
+    print(f"Backing up every: 15 minutes")
     print("Press Ctrl+C to stop.\n")
     try:
         httpd.serve_forever()

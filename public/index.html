@@ -104,12 +104,27 @@
       font-weight: 600;
       color: #4f46e5;
       letter-spacing: 0.08em;
+      cursor: pointer;
+      transition: color 0.15s;
     }
+    .doc-id:hover { color: #6366f1; }
+    .doc-id.copied { color: #16a34a; }
 
     .added-at { color: #888; font-size: 0.8rem; }
     .file-link { color: #1a1a2e; text-decoration: none; }
     .file-link:hover { text-decoration: underline; color: #4f46e5; }
     .deleted { color: #ef4444; font-size: 0.8rem; font-weight: 600; }
+    .renamed-badge {
+      background: #fef3c7;
+      color: #92400e;
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 0.1rem 0.4rem;
+      border-radius: 3px;
+      margin-right: 0.35rem;
+      vertical-align: middle;
+      cursor: default;
+    }
 
     #empty { display: none; text-align: center; padding: 2rem; color: #aaa; font-size: 0.95rem; }
 
@@ -173,9 +188,10 @@
     .apply-btn:hover:not(:disabled) { background: #e0e7ff; border-color: #4f46e5; color: #4f46e5; }
     .apply-btn:disabled { opacity: 0.4; cursor: default; }
 
-    .ref-cell { cursor: text; min-width: 10rem; color: #374151; }
+    .ref-cell, .desc-cell { cursor: text; min-width: 10rem; color: #374151; }
     .ref-cell:empty::before { content: 'Click to add…'; color: #ccc; font-style: italic; }
-    .ref-cell input {
+    .desc-cell:empty::before { content: 'Click to add…'; color: #ccc; font-style: italic; }
+    .ref-cell input, .desc-cell input {
       width: 100%;
       border: 1px solid #4f46e5;
       border-radius: 4px;
@@ -240,9 +256,9 @@
   <div id="apply-all-status"></div>
 
   <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1rem;">
-    <input id="search" type="text" placeholder="Search file names…" style="margin-bottom:0;flex:1;" />
+    <input id="search" type="text" placeholder="Search file names or descriptions…" style="margin-bottom:0;flex:1;" />
     <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.85rem;color:#555;white-space:nowrap;cursor:pointer;">
-      <input type="checkbox" id="show-deleted" checked /> Show deleted
+      <input type="checkbox" id="show-deleted" /> Show deleted
     </label>
     <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.85rem;color:#555;white-space:nowrap;">
       Rows:
@@ -262,12 +278,13 @@
         <th>Subfolder</th>
         <th>File Name</th>
         <th>Reference</th>
+        <th>Description</th>
         <th>Apply</th>
         <th>Status</th>
       </tr>
     </thead>
     <tbody id="doc-body">
-      <tr id="empty"><td colspan="7">No documents found in the watched folder.</td></tr>
+      <tr id="empty"><td colspan="8">No documents found in the watched folder.</td></tr>
     </tbody>
   </table>
 
@@ -279,6 +296,19 @@
     let nextRefresh = Date.now() + REFRESH_MS;
     let allDocs = [];
     let currentPage = 1;
+
+    // Tracks doc IDs whose rename badge should be suppressed this render cycle.
+    // Populated on each fetchDocuments() call from localStorage.
+    let hiddenRenameBadges = new Set();
+
+    const SEEN_RENAMES_KEY = 'crossref_seen_renames';
+    function getSeenRenameCounts() {
+      try { return JSON.parse(localStorage.getItem(SEEN_RENAMES_KEY) || '{}'); }
+      catch { return {}; }
+    }
+    function saveSeenRenameCounts(counts) {
+      localStorage.setItem(SEEN_RENAMES_KEY, JSON.stringify(counts));
+    }
 
     async function fetchDocuments() {
       const dot  = document.getElementById('status-dot');
@@ -294,6 +324,20 @@
         document.getElementById('meta').textContent =
           `Last server update: ${new Date(data.lastUpdated).toLocaleString()}`;
 
+        // Determine which rename badges to suppress this render (already seen before)
+        const seenCounts = getSeenRenameCounts();
+        hiddenRenameBadges = new Set(
+          data.documents
+            .filter(d => d.renames && (seenCounts[d.id] || 0) >= d.renames.length)
+            .map(d => d.id)
+        );
+        // Advance stored counts so the badge hides on the next fetch
+        const updatedCounts = { ...seenCounts };
+        for (const doc of data.documents) {
+          if (doc.renames && doc.renames.length > 0) updatedCounts[doc.id] = doc.renames.length;
+        }
+        saveSeenRenameCounts(updatedCounts);
+
         allDocs = data.documents;
         renderTable();
         nextRefresh = Date.now() + REFRESH_MS;
@@ -307,12 +351,22 @@
       return parseInt(document.getElementById('page-size-select').value, 10);
     }
 
+    function matchesQuery(doc, query) {
+      const name = doc.fileName.toLowerCase();
+      const desc = (doc.description || '').toLowerCase();
+      const prevNames = (doc.renames || []).map(r => r.from.toLowerCase()).join(' ');
+      if (name.includes(query) || desc.includes(query) || prevNames.includes(query)) return true;
+      const terms = query.split(/\s+/).filter(Boolean);
+      const words = (name + ' ' + desc + ' ' + prevNames).split(/[\s._\-]+/).filter(Boolean);
+      return terms.every(term => words.some(word => word.startsWith(term)));
+    }
+
     function getFilteredDocs() {
       const query = document.getElementById('search').value.toLowerCase();
       const showDeleted = document.getElementById('show-deleted').checked;
       let docs = allDocs;
       if (!showDeleted) docs = docs.filter(d => !d.removedAt);
-      if (query) docs = docs.filter(d => d.fileName.toLowerCase().includes(query));
+      if (query) docs = docs.filter(d => matchesQuery(d, query));
       return docs;
     }
 
@@ -330,7 +384,7 @@
 
       if (filtered.length === 0) {
         const row = document.createElement('tr');
-        row.innerHTML = '<td colspan="7" style="text-align:center;color:#aaa;padding:2rem">No documents found in the watched folder.</td>';
+        row.innerHTML = '<td colspan="8" style="text-align:center;color:#aaa;padding:2rem">No documents found in the watched folder.</td>';
         tbody.appendChild(row);
         renderPagination(0, 1, 1);
         return;
@@ -340,15 +394,13 @@
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td>${start + i + 1}</td>
-          <td><span class="doc-id">${doc.id}</span></td>
+          <td><span class="doc-id" title="Click to copy {${doc.id}}" onclick="copyDocId(this, '${doc.id}')">${doc.id}</span></td>
           <td class="subfolder">${escapeHtml(doc.subfolder || '—')}</td>
           <td><a class="file-link" href="#" data-subfolder="${escapeHtml(doc.subfolder || '')}" data-filename="${escapeHtml(doc.fileName)}">${escapeHtml(doc.fileName)}</a></td>
           <td class="ref-cell" data-id="${doc.id}">${escapeHtml(doc.reference || '')}</td>
+          <td class="desc-cell" data-id="${doc.id}">${escapeHtml(doc.description || '')}</td>
           <td>${applyCell(doc)}</td>
-          <td>${doc.removedAt
-            ? '<span class="deleted">Deleted</span>'
-            : `<span class="added-at">${new Date(doc.addedAt).toLocaleString('en-GB')}</span>`
-          }</td>
+          <td>${statusCell(doc)}</td>
         `;
         tbody.appendChild(tr);
       });
@@ -406,10 +458,28 @@
       return [1, '…', current-1, current, current+1, '…', total];
     }
 
+    function statusCell(doc) {
+      const showBadge = doc.renames && doc.renames.length > 0 && !hiddenRenameBadges.has(doc.id);
+      const renamedBadge = showBadge
+        ? `<span class="renamed-badge" title="Previously: ${doc.renames.map(r => escapeHtml(r.from)).join(' → ')}">renamed</span>`
+        : '';
+      if (doc.removedAt) {
+        return renamedBadge + '<span class="deleted">Deleted</span>';
+      }
+      return renamedBadge + `<span class="added-at">${new Date(doc.addedAt).toLocaleString('en-GB')}</span>`;
+    }
+
     function applyCell(doc) {
       if (!doc.reference) return '<span style="color:#ccc;font-size:0.75rem">—</span>';
       const label = doc.lastWrittenValue === doc.reference ? 'Re-apply' : 'Apply';
       return `<button class="apply-btn" data-id="${escapeHtml(doc.id)}">${label}</button>`;
+    }
+
+    function copyDocId(el, id) {
+      navigator.clipboard.writeText(`{${id}}`).then(() => {
+        el.classList.add('copied');
+        setTimeout(() => el.classList.remove('copied'), 1000);
+      });
     }
 
     function escapeHtml(str) {
@@ -455,9 +525,10 @@
         return;
       }
 
-      const cell = e.target.closest('td.ref-cell');
+      const cell = e.target.closest('td.ref-cell, td.desc-cell');
       if (!cell || cell.querySelector('input')) return; // already editing
 
+      const isDesc = cell.classList.contains('desc-cell');
       const docId = cell.dataset.id;
       const original = cell.textContent;
 
@@ -474,12 +545,25 @@
         if (saved) return;
         saved = true;
         const value = input.value;
-        await fetch(`/api/reference?id=${encodeURIComponent(docId)}`, {
-          method: 'POST',
-          body: value,
-        });
+        const endpoint = isDesc ? 'description' : 'reference';
+        try {
+          const res = await fetch(`/api/${endpoint}?id=${encodeURIComponent(docId)}`, {
+            method: 'POST',
+            body: value,
+            keepalive: true,
+          });
+          if (!res.ok) {
+            console.error(`Failed to save ${endpoint}:`, res.status);
+            cell.textContent = original;
+            return;
+          }
+        } catch (err) {
+          console.error(`Failed to save ${endpoint}:`, err);
+          cell.textContent = original;
+          return;
+        }
         const doc = allDocs.find(d => d.id === docId);
-        if (doc) doc.reference = value;
+        if (doc) doc[isDesc ? 'description' : 'reference'] = value;
         cell.textContent = value;
       }
 
@@ -561,8 +645,10 @@
         'Subfolder':     doc.subfolder || '',
         'File Name':     doc.fileName,
         'Reference':     doc.reference || '',
+        'Description':   doc.description || '',
         'Last Written':  doc.lastWrittenValue || '',
         'Added At':      doc.addedAt ? new Date(doc.addedAt).toLocaleString('en-GB') : '',
+        'Previous Names': (doc.renames || []).map(r => r.from).join(' → '),
         'Status':        doc.removedAt ? 'Deleted' : 'Active',
       }));
 
