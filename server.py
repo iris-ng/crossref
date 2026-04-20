@@ -10,7 +10,10 @@ and serves a small web UI at http://localhost:3000
 
 import sys
 import os
+import csv
+import io
 import json
+import itertools
 import random
 import string
 import shutil
@@ -26,6 +29,12 @@ try:
 except ImportError:
     REPLACE_ENABLED = False
 
+try:
+    import openpyxl
+    OPENPYXL_ENABLED = True
+except ImportError:
+    OPENPYXL_ENABLED = False
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -37,6 +46,26 @@ REGISTRY_DIR = os.path.join(os.path.dirname(__file__), "registries")
 BACKUP_DIR   = os.path.join(os.path.dirname(__file__), "backups")
 os.makedirs(REGISTRY_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
+
+MAX_IMPORT_BYTES = 50 * 1024 * 1024  # 50 MB — generous ceiling for any realistic CSV/xlsx
+
+# Column aliases accepted in CSV/xlsx imports (lowercase, stripped)
+IMPORT_COLUMN_ALIASES = {
+    "id":          "id",
+    "document id": "id",
+    "doc id":      "id",
+    "file name":   "fileName",
+    "filename":    "fileName",
+    "file":        "fileName",
+    "subfolder":   "subfolder",
+    "sub folder":  "subfolder",
+    "folder":      "subfolder",
+    "reference":   "reference",
+    "ref":         "reference",
+    "description": "description",
+    "desc":        "description",
+    "notes":       "description",
+}
 
 # ---------------------------------------------------------------------------
 # CLI argument
@@ -267,7 +296,8 @@ class Handler(SimpleHTTPRequestHandler):
                 else os.path.join(TARGET_FOLDER, file_name)
             )
             # Safety check: must still be inside the target folder
-            if not full_path.startswith(os.path.normpath(TARGET_FOLDER)):
+            target_norm = os.path.normpath(TARGET_FOLDER)
+            if os.path.commonpath([full_path, target_norm]) != target_norm:
                 self.send_response(403)
                 self.end_headers()
                 return
@@ -307,6 +337,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(b'{"ok":true}')
         elif parsed.path == "/api/replace":
             self._handle_replace(parsed)
+        elif parsed.path == "/api/import":
+            self._handle_import(parsed)
         else:
             self.send_response(404)
             self.end_headers()
@@ -372,6 +404,179 @@ class Handler(SimpleHTTPRequestHandler):
         doc["lastWrittenValue"] = reference
         save_docs(docs)
         respond(200, {"ok": True})
+
+    def _handle_import(self, parsed):
+        from urllib.parse import parse_qs
+
+        def respond(code, body):
+            data = json.dumps(body).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        qs = parse_qs(parsed.query)
+        filename = (qs.get("filename") or ["upload"])[0]
+        ext = os.path.splitext(filename)[1].lower()
+
+        content_length_str = self.headers.get("Content-Length")
+        if content_length_str is None:
+            respond(411, {"error": "Content-Length header required"}); return
+        length = int(content_length_str)
+        if length == 0:
+            respond(400, {"error": "Empty file"}); return
+        if length > MAX_IMPORT_BYTES:
+            respond(400, {"error": f"File too large (max {MAX_IMPORT_BYTES // (1024 * 1024)} MB)"}); return
+        file_data = self.rfile.read(length)
+
+        # Parse file into a list of raw dicts
+        try:
+            if ext == ".csv":
+                text = file_data.decode("utf-8-sig")  # strip BOM if present
+                raw_rows = list(csv.DictReader(io.StringIO(text)))
+            elif ext in (".xlsx", ".xls"):
+                if not OPENPYXL_ENABLED:
+                    respond(503, {"error": "openpyxl not installed — run: pip install openpyxl"}); return
+                wb = openpyxl.load_workbook(io.BytesIO(file_data), read_only=True, data_only=True)
+                ws = wb.active
+                headers = None
+                raw_rows = []
+                for row in ws.iter_rows(values_only=True):
+                    if headers is None:
+                        headers = [str(c).strip() if c is not None else "" for c in row]
+                        continue
+                    cells = [str(c).strip() if c is not None else "" for c in row]
+                    raw_rows.append(dict(itertools.zip_longest(headers, cells, fillvalue="")))
+                wb.close()
+            else:
+                respond(400, {"error": f"Unsupported file type '{ext}' — use .csv or .xlsx"}); return
+        except Exception as e:
+            respond(400, {"error": f"Could not parse file: {e}"}); return
+
+        def normalize_row(raw):
+            result = {}
+            for col, val in raw.items():
+                key = IMPORT_COLUMN_ALIASES.get((col or "").lower().strip())
+                if key is not None:
+                    result[key] = str(val).strip() if val is not None else ""
+            return result
+
+        docs = load_docs()
+        used_ids = {d["id"] for d in docs.values()}
+
+        added_lines     = []
+        updated_lines   = []
+        unchanged_lines = []
+        skipped_lines   = []
+
+        for row_num, raw_row in enumerate(raw_rows, start=2):  # row 1 is the header
+            row = normalize_row(raw_row)
+
+            # Skip fully empty rows
+            if not any(row.values()):
+                continue
+
+            file_name = row.get("fileName", "")
+            raw_sub   = row.get("subfolder", "").strip()
+            subfolder = os.path.normpath(raw_sub) if raw_sub else ""
+            label     = row.get("id") or file_name or f"row {row_num}"
+
+            matched_key = None
+
+            # 1. Match by ID (preferred — unambiguous)
+            if row.get("id"):
+                matched_key = next((k for k, d in docs.items() if d["id"] == row["id"]), None)
+
+            # 2. Fallback: fileName + subfolder
+            if matched_key is None and file_name:
+                candidates = [
+                    k for k, d in docs.items()
+                    if d["fileName"] == file_name and d.get("subfolder", "") == subfolder
+                ]
+                if len(candidates) == 1:
+                    matched_key = candidates[0]
+                elif len(candidates) > 1:
+                    skipped_lines.append(
+                        f"  Row {row_num}: '{label}' — matches {len(candidates)} entries, "
+                        f"add an ID column or Subfolder to disambiguate"
+                    )
+                    continue
+
+            if matched_key is not None:
+                # Entry exists — update non-empty fields
+                changed = False
+                field_changes = []
+                for field in ("reference", "description"):
+                    if row.get(field):
+                        docs[matched_key][field] = row[field]
+                        field_changes.append(f'{field} → "{row[field]}"')
+                        changed = True
+
+                doc_id = docs[matched_key]["id"]
+                if changed:
+                    updated_lines.append(f"  Row {row_num}: '{label}' ({doc_id}) — {', '.join(field_changes)}")
+                else:
+                    unchanged_lines.append(f"  Row {row_num}: '{label}' ({doc_id}) — already in registry, no new values provided")
+
+            else:
+                # No match — create a new registry entry
+                if not file_name:
+                    skipped_lines.append(f"  Row {row_num}: '{label}' — no file name provided, cannot create entry")
+                    continue
+
+                new_id  = generate_id(used_ids)
+                used_ids.add(new_id)
+                new_key = os.path.join(subfolder, file_name) if subfolder else file_name
+                entry   = {
+                    "id":       new_id,
+                    "fileName": file_name,
+                    "subfolder": subfolder,
+                    "addedAt":  datetime.now(timezone.utc).isoformat(),
+                }
+                for field in ("reference", "description"):
+                    if row.get(field):
+                        entry[field] = row[field]
+                docs[new_key] = entry
+                added_lines.append(f"  Row {row_num}: '{file_name}' — new ID: {new_id}")
+
+        if added_lines or updated_lines:
+            save_docs(docs)
+
+        # Build the text report
+        now_str    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        total_rows = len(added_lines) + len(updated_lines) + len(unchanged_lines) + len(skipped_lines)
+        report_lines = [
+            "Crossref Import Report",
+            now_str,
+            "=" * 42,
+            "",
+            "Summary",
+            "-------",
+            f"  Added (new entries):   {len(added_lines)}",
+            f"  Updated (fields set):  {len(updated_lines)}",
+            f"  Unchanged:             {len(unchanged_lines)}",
+            f"  Skipped (errors):      {len(skipped_lines)}",
+            f"  Total rows processed:  {total_rows}",
+        ]
+        for section_title, lines in (
+            ("ADDED",     added_lines),
+            ("UPDATED",   updated_lines),
+            ("UNCHANGED", unchanged_lines),
+            ("SKIPPED",   skipped_lines),
+        ):
+            if lines:
+                report_lines += ["", section_title, "-" * len(section_title)]
+                report_lines += lines
+
+        respond(200, {
+            "ok":        True,
+            "added":     len(added_lines),
+            "updated":   len(updated_lines),
+            "unchanged": len(unchanged_lines),
+            "skipped":   len(skipped_lines),
+            "report":    "\n".join(report_lines),
+        })
 
     def _serve_api(self):
         docs = load_docs()
