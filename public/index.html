@@ -80,6 +80,34 @@
     }
     #export-btn:hover { background: #dcfce7; }
 
+    #import-btn {
+      margin-left: 0.5rem;
+      padding: 0.25rem 0.75rem;
+      font-size: 0.8rem;
+      border: 1px solid #fde68a;
+      border-radius: 4px;
+      background: #fffbeb;
+      color: #92400e;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    #import-btn:hover:not(:disabled) { background: #fef3c7; }
+    #import-btn:disabled { opacity: 0.5; cursor: default; }
+    #import-btn.drag-over {
+      background: #fef3c7;
+      border-color: #f59e0b;
+      outline: 2px dashed #f59e0b;
+      outline-offset: 2px;
+    }
+
+    #import-status {
+      font-size: 0.82rem;
+      min-height: 1.1rem;
+      color: #555;
+      margin-bottom: 0.75rem;
+    }
+    #import-status.error { color: #ef4444; }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -244,7 +272,10 @@
     <span id="status-text">Loading…</span>
     <button id="refresh-btn" onclick="forceRefresh()">Refresh</button>
     <button id="export-btn" onclick="exportToExcel()">Export to Excel</button>
+    <button id="import-btn">Import CSV/Excel</button>
+    <input id="import-file" type="file" accept=".csv,.xlsx" style="display:none">
   </div>
+  <div id="import-status"></div>
 
   <div id="meta"></div>
 
@@ -256,7 +287,7 @@
   <div id="apply-all-status"></div>
 
   <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1rem;">
-    <input id="search" type="text" placeholder="Search file names or descriptions…" style="margin-bottom:0;flex:1;" />
+    <input id="search" type="text" placeholder="Search IDs, file names or descriptions…" style="margin-bottom:0;flex:1;" />
     <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.85rem;color:#555;white-space:nowrap;cursor:pointer;">
       <input type="checkbox" id="show-deleted" /> Show deleted
     </label>
@@ -352,12 +383,13 @@
     }
 
     function matchesQuery(doc, query) {
+      const id = doc.id.toLowerCase();
       const name = doc.fileName.toLowerCase();
       const desc = (doc.description || '').toLowerCase();
       const prevNames = (doc.renames || []).map(r => r.from.toLowerCase()).join(' ');
-      if (name.includes(query) || desc.includes(query) || prevNames.includes(query)) return true;
+      if (id.includes(query) || name.includes(query) || desc.includes(query) || prevNames.includes(query)) return true;
       const terms = query.split(/\s+/).filter(Boolean);
-      const words = (name + ' ' + desc + ' ' + prevNames).split(/[\s._\-]+/).filter(Boolean);
+      const words = (id + ' ' + name + ' ' + desc + ' ' + prevNames).split(/[\s._\-]+/).filter(Boolean);
       return terms.every(term => words.some(word => word.startsWith(term)));
     }
 
@@ -483,7 +515,7 @@
     }
 
     function escapeHtml(str) {
-      return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
     document.getElementById('doc-body').addEventListener('click', async function(e) {
@@ -667,6 +699,98 @@
     fetchDocuments();
     setInterval(fetchDocuments, REFRESH_MS);
     setInterval(updateCountdown, 1000);
+
+    // ---------------------------------------------------------------------------
+    // Import CSV / Excel
+    // ---------------------------------------------------------------------------
+    (function () {
+      const btn       = document.getElementById('import-btn');
+      const fileInput = document.getElementById('import-file');
+
+      btn.addEventListener('click', () => fileInput.click());
+
+      btn.addEventListener('dragover', e => {
+        e.preventDefault();
+        btn.classList.add('drag-over');
+      });
+      btn.addEventListener('dragleave', () => btn.classList.remove('drag-over'));
+      btn.addEventListener('drop', e => {
+        e.preventDefault();
+        btn.classList.remove('drag-over');
+        const file = e.dataTransfer.files[0];
+        if (file) handleImportFile(file);
+      });
+
+      fileInput.addEventListener('change', () => {
+        if (fileInput.files[0]) handleImportFile(fileInput.files[0]);
+        fileInput.value = '';
+      });
+    })();
+
+    function downloadText(content, filename) {
+      const blob = new Blob([content], { type: 'text/plain' });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href     = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    async function handleImportFile(file) {
+      const status = document.getElementById('import-status');
+      const btn    = document.getElementById('import-btn');
+
+      const ext = file.name.split('.').pop().toLowerCase();
+      if (!['csv', 'xlsx'].includes(ext)) {
+        status.className   = 'error';
+        status.textContent = `Unsupported file type ".${ext}" — use .csv or .xlsx`;
+        return;
+      }
+
+      btn.disabled    = true;
+      btn.textContent = 'Importing…';
+      status.className   = '';
+      status.textContent = '';
+
+      try {
+        const res  = await fetch(`/api/import?filename=${encodeURIComponent(file.name)}`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body:    file,
+        });
+        const data = await res.json();
+
+        if (data.ok) {
+          const parts = [];
+          if (data.added)     parts.push(`${data.added} added`);
+          if (data.updated)   parts.push(`${data.updated} updated`);
+          if (data.unchanged) parts.push(`${data.unchanged} unchanged`);
+          if (data.skipped)   parts.push(`${data.skipped} skipped`);
+          status.className   = '';
+          status.textContent = `Import complete — ${parts.join(', ') || 'nothing to do'}.`;
+
+          if (data.report) {
+            const date = new Date().toISOString().slice(0, 10);
+            downloadText(data.report, `import-report-${date}.txt`);
+          }
+
+          if (data.added || data.updated) await fetchDocuments();
+        } else {
+          status.className   = 'error';
+          status.textContent = `Import failed: ${data.error || 'Unknown error'}`;
+        }
+      } catch (err) {
+        status.className   = 'error';
+        status.textContent = 'Import error — could not reach server.';
+      }
+
+      btn.disabled    = false;
+      btn.textContent = 'Import CSV/Excel';
+      setTimeout(() => { status.textContent = ''; status.className = ''; }, 8000);
+    }
   </script>
 </body>
 </html>
