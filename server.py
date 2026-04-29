@@ -38,6 +38,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+HOST = "127.0.0.1"              # localhost only — never bind to 0.0.0.0
 PORT = 3000
 SCAN_INTERVAL   = 1 * 60        # seconds
 BACKUP_INTERVAL = 15 * 60       # seconds
@@ -48,6 +49,20 @@ os.makedirs(REGISTRY_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 MAX_IMPORT_BYTES = 50 * 1024 * 1024  # 50 MB — generous ceiling for any realistic CSV/xlsx
+
+# Extensions allowed via /api/open. Anything that Windows' default handler
+# could execute (.exe, .bat, .cmd, .lnk, .ps1, .docm, .hta, ...) stays out.
+OPEN_ALLOWED_EXTS = {
+    ".docx", ".doc", ".pdf", ".xlsx", ".xls", ".csv",
+    ".txt", ".md", ".rtf", ".pptx", ".ppt",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg",
+}
+
+# CSRF defense: only accept POSTs whose Origin/Referer points at our own server.
+ALLOWED_ORIGINS = {f"http://{HOST}:{PORT}", f"http://localhost:{PORT}"}
+
+# Serialize all read-modify-write access to the registry JSON.
+_DOCS_LOCK = threading.Lock()
 
 # Column aliases accepted in CSV/xlsx imports (lowercase, stripped)
 IMPORT_COLUMN_ALIASES = {
@@ -135,6 +150,11 @@ def collect_files(root: str):
 
 
 def scan_folder():
+    with _DOCS_LOCK:
+        _scan_folder_locked()
+
+
+def _scan_folder_locked():
     docs = load_docs()
     used_ids = {d["id"] for d in docs.values()}
     changed = False
@@ -239,14 +259,15 @@ def scanner_loop():
 
 def backup_registries():
     """Copy all registry JSON files into a timestamped subfolder under backups/."""
-    json_files = [f for f in os.listdir(REGISTRY_DIR) if f.endswith(".json")]
-    if not json_files:
-        return
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    dest = os.path.join(BACKUP_DIR, stamp)
-    os.makedirs(dest, exist_ok=True)
-    for fname in json_files:
-        shutil.copy2(os.path.join(REGISTRY_DIR, fname), os.path.join(dest, fname))
+    with _DOCS_LOCK:
+        json_files = [f for f in os.listdir(REGISTRY_DIR) if f.endswith(".json")]
+        if not json_files:
+            return
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        dest = os.path.join(BACKUP_DIR, stamp)
+        os.makedirs(dest, exist_ok=True)
+        for fname in json_files:
+            shutil.copy2(os.path.join(REGISTRY_DIR, fname), os.path.join(dest, fname))
     print(f"[backup] {stamp} — {len(json_files)} registry file(s) backed up")
 
 
@@ -274,7 +295,25 @@ class Handler(SimpleHTTPRequestHandler):
         else:
             super().do_GET()
 
+    def _csrf_ok(self) -> bool:
+        """Reject cross-origin POSTs. Origin (when present) is the strong signal;
+        fall back to Referer. A request with neither header is also rejected."""
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            return origin in ALLOWED_ORIGINS
+        referer = self.headers.get("Referer")
+        if referer is not None:
+            return any(referer.startswith(o + "/") or referer == o
+                       for o in ALLOWED_ORIGINS)
+        return False
+
     def do_POST(self):
+        if not self._csrf_ok():
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"cross-origin request rejected"}')
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/scan":
             scan_folder()
@@ -290,6 +329,13 @@ class Handler(SimpleHTTPRequestHandler):
             if not file_name:
                 self.send_response(400)
                 self.end_headers()
+                return
+            ext = os.path.splitext(file_name)[1].lower()
+            if ext not in OPEN_ALLOWED_EXTS:
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"file type not permitted"}')
                 return
             full_path = os.path.normpath(
                 os.path.join(TARGET_FOLDER, subfolder, file_name) if subfolder
@@ -323,14 +369,15 @@ class Handler(SimpleHTTPRequestHandler):
             field = "description" if parsed.path == "/api/description" else "reference"
             length = int(self.headers.get("Content-Length", 0))
             value = self.rfile.read(length).decode("utf-8") if length else ""
-            docs = load_docs()
-            matched_key = next((k for k, d in docs.items() if d["id"] == doc_id), None)
-            if matched_key is None:
-                self.send_response(404)
-                self.end_headers()
-                return
-            docs[matched_key][field] = value.strip()
-            save_docs(docs)
+            with _DOCS_LOCK:
+                docs = load_docs()
+                matched_key = next((k for k, d in docs.items() if d["id"] == doc_id), None)
+                if matched_key is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                docs[matched_key][field] = value.strip()
+                save_docs(docs)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -367,22 +414,32 @@ class Handler(SimpleHTTPRequestHandler):
         if not target:
             respond(400, {"error": "missing target document path"}); return
 
-        # Resolve target: use as-is if absolute and exists, else look in TARGET_FOLDER
+        # Resolve target: use as-is if absolute, else look in TARGET_FOLDER
         if os.path.isabs(target):
             target_path = os.path.normpath(target)
         else:
             target_path = os.path.normpath(os.path.join(TARGET_FOLDER, target))
 
+        # Containment check: target must live inside the watched folder
+        target_norm = os.path.normpath(os.path.abspath(TARGET_FOLDER))
+        target_abs  = os.path.abspath(target_path)
+        try:
+            if os.path.commonpath([target_abs, target_norm]) != target_norm:
+                respond(403, {"error": "target must be inside the watched folder"}); return
+        except ValueError:
+            # commonpath raises ValueError when paths are on different drives
+            respond(403, {"error": "target must be inside the watched folder"}); return
+
         if not os.path.exists(target_path):
             respond(404, {"error": f"Target document not found: {target_path}"}); return
 
-        docs = load_docs()
-        matched_key = next((k for k, d in docs.items() if d["id"] == doc_id), None)
-        if matched_key is None:
-            respond(404, {"error": "document not found in registry"}); return
-
-        doc = docs[matched_key]
-        reference = doc.get("reference", "").strip()
+        # Read the reference under the lock, then release it for the (slow) docx work.
+        with _DOCS_LOCK:
+            docs = load_docs()
+            matched_key = next((k for k, d in docs.items() if d["id"] == doc_id), None)
+            if matched_key is None:
+                respond(404, {"error": "document not found in registry"}); return
+            reference = docs[matched_key].get("reference", "").strip()
         if not reference:
             respond(400, {"error": "no reference set for this document"}); return
 
@@ -400,9 +457,17 @@ class Handler(SimpleHTTPRequestHandler):
             "target": target_path,
             "at":     datetime.now(timezone.utc).isoformat(),
         }
-        doc.setdefault("replacements", []).append(entry)
-        doc["lastWrittenValue"] = reference
-        save_docs(docs)
+        # Re-load + write the registry under the lock (the entry may have changed
+        # in between — e.g. a concurrent reference edit).
+        with _DOCS_LOCK:
+            docs = load_docs()
+            matched_key = next((k for k, d in docs.items() if d["id"] == doc_id), None)
+            if matched_key is None:
+                respond(404, {"error": "document removed from registry during replace"}); return
+            doc = docs[matched_key]
+            doc.setdefault("replacements", []).append(entry)
+            doc["lastWrittenValue"] = reference
+            save_docs(docs)
         respond(200, {"ok": True})
 
     def _handle_import(self, parsed):
@@ -462,86 +527,87 @@ class Handler(SimpleHTTPRequestHandler):
                     result[key] = str(val).strip() if val is not None else ""
             return result
 
-        docs = load_docs()
-        used_ids = {d["id"] for d in docs.values()}
-
         added_lines     = []
         updated_lines   = []
         unchanged_lines = []
         skipped_lines   = []
 
-        for row_num, raw_row in enumerate(raw_rows, start=2):  # row 1 is the header
-            row = normalize_row(raw_row)
+        with _DOCS_LOCK:
+            docs = load_docs()
+            used_ids = {d["id"] for d in docs.values()}
 
-            # Skip fully empty rows
-            if not any(row.values()):
-                continue
+            for row_num, raw_row in enumerate(raw_rows, start=2):  # row 1 is the header
+                row = normalize_row(raw_row)
 
-            file_name = row.get("fileName", "")
-            raw_sub   = row.get("subfolder", "").strip()
-            subfolder = os.path.normpath(raw_sub) if raw_sub else ""
-            label     = row.get("id") or file_name or f"row {row_num}"
-
-            matched_key = None
-
-            # 1. Match by ID (preferred — unambiguous)
-            if row.get("id"):
-                matched_key = next((k for k, d in docs.items() if d["id"] == row["id"]), None)
-
-            # 2. Fallback: fileName + subfolder
-            if matched_key is None and file_name:
-                candidates = [
-                    k for k, d in docs.items()
-                    if d["fileName"] == file_name and d.get("subfolder", "") == subfolder
-                ]
-                if len(candidates) == 1:
-                    matched_key = candidates[0]
-                elif len(candidates) > 1:
-                    skipped_lines.append(
-                        f"  Row {row_num}: '{label}' — matches {len(candidates)} entries, "
-                        f"add an ID column or Subfolder to disambiguate"
-                    )
+                # Skip fully empty rows
+                if not any(row.values()):
                     continue
 
-            if matched_key is not None:
-                # Entry exists — update non-empty fields
-                changed = False
-                field_changes = []
-                for field in ("reference", "description"):
-                    if row.get(field):
-                        docs[matched_key][field] = row[field]
-                        field_changes.append(f'{field} → "{row[field]}"')
-                        changed = True
+                file_name = row.get("fileName", "")
+                raw_sub   = row.get("subfolder", "").strip()
+                subfolder = os.path.normpath(raw_sub) if raw_sub else ""
+                label     = row.get("id") or file_name or f"row {row_num}"
 
-                doc_id = docs[matched_key]["id"]
-                if changed:
-                    updated_lines.append(f"  Row {row_num}: '{label}' ({doc_id}) — {', '.join(field_changes)}")
+                matched_key = None
+
+                # 1. Match by ID (preferred — unambiguous)
+                if row.get("id"):
+                    matched_key = next((k for k, d in docs.items() if d["id"] == row["id"]), None)
+
+                # 2. Fallback: fileName + subfolder
+                if matched_key is None and file_name:
+                    candidates = [
+                        k for k, d in docs.items()
+                        if d["fileName"] == file_name and d.get("subfolder", "") == subfolder
+                    ]
+                    if len(candidates) == 1:
+                        matched_key = candidates[0]
+                    elif len(candidates) > 1:
+                        skipped_lines.append(
+                            f"  Row {row_num}: '{label}' — matches {len(candidates)} entries, "
+                            f"add an ID column or Subfolder to disambiguate"
+                        )
+                        continue
+
+                if matched_key is not None:
+                    # Entry exists — update non-empty fields
+                    changed = False
+                    field_changes = []
+                    for field in ("reference", "description"):
+                        if row.get(field):
+                            docs[matched_key][field] = row[field]
+                            field_changes.append(f'{field} → "{row[field]}"')
+                            changed = True
+
+                    doc_id = docs[matched_key]["id"]
+                    if changed:
+                        updated_lines.append(f"  Row {row_num}: '{label}' ({doc_id}) — {', '.join(field_changes)}")
+                    else:
+                        unchanged_lines.append(f"  Row {row_num}: '{label}' ({doc_id}) — already in registry, no new values provided")
+
                 else:
-                    unchanged_lines.append(f"  Row {row_num}: '{label}' ({doc_id}) — already in registry, no new values provided")
+                    # No match — create a new registry entry
+                    if not file_name:
+                        skipped_lines.append(f"  Row {row_num}: '{label}' — no file name provided, cannot create entry")
+                        continue
 
-            else:
-                # No match — create a new registry entry
-                if not file_name:
-                    skipped_lines.append(f"  Row {row_num}: '{label}' — no file name provided, cannot create entry")
-                    continue
+                    new_id  = generate_id(used_ids)
+                    used_ids.add(new_id)
+                    new_key = os.path.join(subfolder, file_name) if subfolder else file_name
+                    entry   = {
+                        "id":       new_id,
+                        "fileName": file_name,
+                        "subfolder": subfolder,
+                        "addedAt":  datetime.now(timezone.utc).isoformat(),
+                    }
+                    for field in ("reference", "description"):
+                        if row.get(field):
+                            entry[field] = row[field]
+                    docs[new_key] = entry
+                    added_lines.append(f"  Row {row_num}: '{file_name}' — new ID: {new_id}")
 
-                new_id  = generate_id(used_ids)
-                used_ids.add(new_id)
-                new_key = os.path.join(subfolder, file_name) if subfolder else file_name
-                entry   = {
-                    "id":       new_id,
-                    "fileName": file_name,
-                    "subfolder": subfolder,
-                    "addedAt":  datetime.now(timezone.utc).isoformat(),
-                }
-                for field in ("reference", "description"):
-                    if row.get(field):
-                        entry[field] = row[field]
-                docs[new_key] = entry
-                added_lines.append(f"  Row {row_num}: '{file_name}' — new ID: {new_id}")
-
-        if added_lines or updated_lines:
-            save_docs(docs)
+            if added_lines or updated_lines:
+                save_docs(docs)
 
         # Build the text report
         now_str    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -615,8 +681,8 @@ if __name__ == "__main__":
     threading.Thread(target=backup_loop,  daemon=True).start()
 
     # HTTP server
-    httpd = HTTPServer(("", PORT), Handler)
-    print(f"Server running at http://localhost:{PORT}")
+    httpd = HTTPServer((HOST, PORT), Handler)
+    print(f"Server running at http://{HOST}:{PORT}")
     print(f"Watching folder : {TARGET_FOLDER}")
     print(f"Registry folder : {REGISTRY_DIR}")
     print(f"Backup folder   : {BACKUP_DIR}")
